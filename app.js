@@ -9,6 +9,9 @@ const app = express();
 const authRoutes = require('./routes/auth');
 const protectedRoute = require('./routes/protectedRoute');
 
+const paymentWebhooks = require('./routes/paymentWebhooks');
+
+
 // Logging Middleware
 app.use(morgan('combined')); // Log all HTTP requests
 
@@ -40,6 +43,10 @@ const authLimiter = rateLimit({
     skipSuccessfulRequests: true, // Don't count successful requests
 });
 
+app.get('/healthz', (req, res) => {
+    res.status(200).json({ ok: true });
+});
+
 app.use(express.json());
 
 // Apply rate limiting
@@ -59,6 +66,8 @@ mongoose.connect('mongodb://localhost:27017/jwt-app')
 
 app.use('/auth', authRoutes);
 app.use('/protected', protectedRoute);
+
+app.use('/webhooks', paymentWebhooks);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
