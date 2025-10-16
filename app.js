@@ -10,6 +10,8 @@ const authRoutes = require('./routes/auth');
 const protectedRoute = require('./routes/protectedRoute');
 
 const paymentWebhooks = require('./routes/paymentWebhooks');
+const ledgerRoutes = require('./routes/ledger');
+
 
 
 // Logging Middleware
@@ -68,6 +70,7 @@ app.use('/auth', authRoutes);
 app.use('/protected', protectedRoute);
 
 app.use('/webhooks', paymentWebhooks);
+app.use('/ledger', ledgerRoutes);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
