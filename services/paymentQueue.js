@@ -1,97 +1,146 @@
+
 const Queue = require('bull');
 const PaymentEvent = require('../models/paymentEvent');
 const LedgerEntry = require('../models/ledgerEntry');
-const { v4: uuidv4 } = require('uuid');
-const counters = require('../utils');
-const Redis = require('ioredis'); // Add this for dedupe store
+const User = require('../models/User');
+const Sentry = require('../config/sentry'); // Import from config
+const Redis = require('ioredis');
 
-
-const DEDUPE_TTL_SECONDS = 60 * 15; // 15 minutes
+const DEDUPE_TTL_SECONDS = 60 * 15;
 
 const redisClient = new Redis({
     host: 'localhost',
     port: 6379,
 });
 
-// Create a Bull queue for payment processing
 const paymentQueue = new Queue('payment-processing', {
     redis: {
         host: 'localhost',
         port: 6379,
     },
     defaultJobOptions: {
-        attempts: 3, // Retry up to 3 times
+        attempts: 3,
         backoff: {
             type: 'exponential',
-            delay: 2000, // Start with 2s delay, then exponential backoff
+            delay: 2000,
         },
     },
 });
 
-// Worker processor - handles idempotent ledger entry writes
+// Worker processor with Sentry
 paymentQueue.process(async (job) => {
     const eventData = job.data;
     const dedupeKey = `dedupe:eventId:${eventData.id}`;
 
-    console.log(`Processing payment event: ${eventData.id}`);
+    console.log(`🔄 Processing payment event: ${eventData.id}`);
 
     try {
-        // Step 1: Check Redis dedupe store first (fast check)
+        // Step 1: Check Redis dedupe store
         const isDuplicate = await redisClient.get(dedupeKey);
         if (isDuplicate) {
-            counters.deduped++;
-            console.log(`Duplicate event ${eventData.id} detected via Redis cache.`);
+            Sentry.captureMessage(`Duplicate event detected: ${eventData.id}`, 'info');
+            console.log(`⏭️  Duplicate event ${eventData.id} detected via Redis cache.`);
             return { status: 'duplicate', eventId: eventData.id };
         }
 
-        // Step 2: Check if LedgerEntry for this event already exists (idempotency)
+        // Step 2: Check if LedgerEntry exists
         const existingLedger = await LedgerEntry.findOne({ id: eventData.id });
-
         if (existingLedger) {
-            counters.deduped++;
-            // Store in Redis dedupe cache for future fast lookups
             await redisClient.set(dedupeKey, "1", "EX", DEDUPE_TTL_SECONDS);
-            console.log(`Ledger entry for event ${eventData.id} already exists, skipping.`);
+            Sentry.captureMessage(`Ledger entry already exists: ${eventData.id}`, 'info');
+            console.log(`⏭️  Ledger entry for event ${eventData.id} already exists, skipping.`);
             return { status: 'duplicate', eventId: eventData.id };
         }
 
-        // Step 3: Create LedgerEntry directly
+        // Step 3: Find User by merchantId
+        const user = await User.findOne({ merchantId: eventData.merchantId });
+        if (!user) {
+            const error = new Error(`User not found for merchantId: ${eventData.merchantId}`);
+            Sentry.captureException(error);
+            throw error;
+        }
+
+        // Step 4: Update or create PaymentEvent
+        const paymentEvent = await PaymentEvent.findOneAndUpdate(
+            { id: eventData.id },
+            {
+                id: eventData.id,
+                type: eventData.type,
+                merchantId: eventData.merchantId,
+                user: user._id,
+                amount: eventData.amount,
+                currency: eventData.currency,
+                status: 'processed',
+                processedAt: new Date(),
+            },
+            { upsert: true, new: true }
+        );
+
+        // Step 5: Create LedgerEntry
         const ledgerEntry = new LedgerEntry({
-            id: eventData.id, // Use event id for ledger entry id to guarantee idempotency
+            id: eventData.id,
+            user: user._id,
+            paymentEvent: paymentEvent._id,
             merchantId: eventData.merchantId,
             amount: eventData.amount,
             currency: eventData.currency,
             createdAt: new Date(eventData.createdAt),
             status: 'recorded',
         });
-        console.log(ledgerEntry);
         await ledgerEntry.save();
 
-        // Step 4: Mark as processed in Redis dedupe store
+        // Step 6: Update references
+        paymentEvent.ledgerEntry = ledgerEntry._id;
+        await paymentEvent.save();
+
+        user.ledgerEntries.push(ledgerEntry._id);
+        user.paymentEvents.push(paymentEvent._id);
+        await user.save();
+
+        // Step 7: Mark as processed in Redis
         await redisClient.set(dedupeKey, "1", "EX", DEDUPE_TTL_SECONDS);
 
-        counters.processed++;
-        console.log(`Ledger entry created for event ${eventData.id}`);
-        return { status: 'success', eventId: eventData.id };
+        console.log(`✅ Ledger entry created for event ${eventData.id}`);
+        return { status: 'success', eventId: eventData.id, userId: user._id };
 
     } catch (error) {
-        counters.failed++;
-        console.error(`Error processing event ${eventData.id}:`, error);
-        throw error; // Will trigger retry
+        Sentry.captureException(error, {
+            tags: {
+                component: 'payment-queue-worker',
+                eventId: eventData.id,
+            },
+            extra: {
+                jobData: eventData,
+                attempts: job.attemptsMade,
+            },
+        });
+
+        console.error(`❌ Error processing event ${eventData.id}:`, error.message);
+        throw error;
     }
 });
 
-// Handle failed jobs (Dead Letter Queue)
+// Handle failed jobs
 paymentQueue.on('failed', async (job, err) => {
-    counters.dlq++;
-    console.error(`Job ${job.id} failed after ${job.attemptsMade} attempts:`, err.message);
-
-    // You can log to a DLQ collection or external system here
-    // Example: await DLQModel.create({ jobId: job.id, data: job.data, error: err.message });
+    console.error(`❌ Job ${job.id} failed after ${job.attemptsMade} attempts:`, err.message);
+    Sentry.captureException(err, {
+        tags: {
+            component: 'payment-queue-failed',
+            jobId: job.id,
+        },
+        extra: {
+            jobData: job.data,
+            attempts: job.attemptsMade,
+        },
+    });
 });
 
 paymentQueue.on('completed', (job, result) => {
-    console.log(`Job ${job.id} completed:`, result);
+    console.log(`✅ Job ${job.id} completed:`, result);
+});
+
+paymentQueue.on('active', (job) => {
+    console.log(`🔄 Job ${job.id} is now active`);
 });
 
 module.exports = paymentQueue;
